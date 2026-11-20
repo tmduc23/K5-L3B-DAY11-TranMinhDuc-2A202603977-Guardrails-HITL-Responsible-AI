@@ -40,26 +40,82 @@ def content_filter(response: str) -> dict:
     redacted = response
 
     # PII patterns to check
+    # Order matters: secrets first, then 12/9-digit IDs before phone numbers.
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "api_key": r"\bsk-[A-Za-z0-9_-]{6,}",
+        "password": r"(?:password|passwd|pwd|mat khau|mật khẩu)\s*(?:is|:|=|la|là)?\s*[:=]?\s*[^\s,;]+",
+        "db_host": r"\b[\w.-]+\.internal(?::\d+)?\b",
+        "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+        "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+        "phone": r"(?<!\d)(?:\+84|0)\d{9,10}(?!\d)",
     }
+    for secret in ("admin123",):
+        if secret in redacted:
+            issues.append("secret: 1 found")
+            redacted = redacted.replace(secret, "[REDACTED]")
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Obfuscated secret leak (spaced / dashed / reversed / base64 / ROT13):
+    # withhold the WHOLE response — partial redaction cannot undo encoding.
+    if obfuscated_secret_leak(redacted):
+        issues.append("obfuscated_secret: withheld")
+        redacted = "[REDACTED] — response withheld: it contained protected internal data."
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
     }
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _secret_needles() -> list[str]:
+    try:
+        from core.config import DEMO_SECRETS
+        needles = [_squash(s) for s in DEMO_SECRETS]
+    except Exception:
+        needles = []
+    needles += ["admin123", "skvinbanksecret2024", "dbvinbankinternal"]
+    return sorted({n for n in needles if len(n) >= 6})
+
+
+def obfuscated_secret_leak(text: str) -> bool:
+    """True if a protected secret appears after undoing common obfuscations."""
+    import base64
+    import binascii
+    import codecs
+    import unicodedata
+
+    base = unicodedata.normalize("NFKC", text or "")
+    views = [base, base[::-1], codecs.decode(base, "rot_13")]
+    for token in re.findall(r"[A-Za-z0-9+/=_-]{8,}", base):
+        padded = token.replace("-", "+").replace("_", "/")
+        padded += "=" * (-len(padded) % 4)
+        try:
+            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+        except (binascii.Error, ValueError):
+            continue
+        views += [decoded, decoded[::-1]]
+    for token in re.findall(r"(?:[0-9a-fA-F]{2}){4,}", base):
+        try:
+            views.append(bytes.fromhex(token).decode("utf-8", errors="ignore"))
+        except ValueError:
+            pass
+    # decimal char codes "97, 100, 109, ..."
+    codes = re.findall(r"\b(\d{2,3})\b", base)
+    if len(codes) >= 6:
+        views.append("".join(chr(int(c)) for c in codes if 32 <= int(c) < 127))
+
+    needles = _secret_needles()
+    return any(n in _squash(v) for v in views for n in needles)
 
 
 # ============================================================
@@ -172,16 +228,27 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            response_text = result["redacted"]
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=response_text)]
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge = await llm_safety_check(response_text)
+            if not judge["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="I'm sorry, I can't share that information. "
+                             "Please contact VinBank support for help."
+                    )],
+                )
+
+        return llm_response
 
 
 # ============================================================

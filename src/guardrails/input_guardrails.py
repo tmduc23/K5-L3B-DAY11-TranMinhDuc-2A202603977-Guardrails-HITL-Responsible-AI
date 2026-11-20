@@ -42,6 +42,59 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+_INVISIBLE_RE = re.compile(r"[​-‏- ⁠-⁯﻿­]")
+
+INJECTION_PATTERNS = [
+    r"\b(ignore|disregard|forget|override|bypass)\b.{0,30}\b(previous|prior|above|earlier|all|your|system)\b.{0,20}\b(instructions?|rules?|prompts?|guidelines?|directives?)",
+    r"\byou are now\b",
+    r"\bsystem prompt\b",
+    r"\b(reveal|show|print|display|repeat|leak|output)\b.{0,20}\b(your|the|internal|hidden|system)\b.{0,20}\b(instructions?|prompt|configuration|config|password|secrets?|api key|credentials?)",
+    r"\bpretend (you are|to be)\b",
+    r"\bact as (a |an )?(unrestricted|unfiltered|jailbroken|dan)\b",
+    r"\b(dan|developer) mode\b",
+    r"\bjailbreak",
+    r"\bno (restrictions|rules|filters|limits)\b",
+    r"\bnew instructions?\s*:",
+    # Vietnamese
+    r"bo qua (tat ca |moi )?(cac )?(huong dan|chi dan|lenh)",
+    r"tiet lo (mat khau|prompt|huong dan)",
+    # Credential elicitation: "password = ___", "api key: ?", fill-in-the-blank
+    r"\b(password|passwd|pwd|mat khau|api[ _-]?key|secret|token|credentials?|db[ _-]?host)\s*[=:]",
+    r"\bfill in the blanks?\b",
+    # Indirect extraction: reference hidden context + obfuscated output format
+    r"\b(from|in) (your|the) (internal )?(notes?|context|instructions|memory|configuration|config)\b",
+    r"\b(login|credential|access|admin) (detail|value|word|info|string)s?\b",
+    r"\binternal (system|note|host|server|value)s?\b",
+    r"\bone (character|char|letter|digit) per line\b|\b(letter|character) by (letter|character)\b|\bspell (it |them )?out\b",
+    r"\bacrostic\b|\bnato phonetic\b|\b(ascii|char(acter)?|unicode) codes?\b|\bhexadecimal\b|\bbackwards\b|\breversed? order\b",
+    r"\b(database|db) (server|host) ?name\b",
+    r"ghi chu noi bo|may chu co so du lieu|ten may chu|thong tin dang nhap",
+    # SQL / code injection smuggled in with a banking keyword
+    r"\bselect\s+(\*|[\w.]+\s*,\s*[\w.]+)\s*.{0,30}\bfrom\b|\bselect\b.{0,40}\bfrom\s+\w+\s*(where|;)",
+    r"\bdelete\s+from\s+\w+\s*(where|;|$)|\binsert\s+into\s+\w+|\bupdate\s+\w+\s+set\s+\w+\s*=",
+    r"\b(drop|truncate|alter)\s+(table|database)\b",
+    r"\bunion\s+(all\s+)?select\b",
+    r"(;|')\s*--|/\*.*\*/|\bor\s+1\s*=\s*1\b",
+    r"<\s*script\b|\b(exec|eval|os\.system|subprocess)\s*\(",
+    r"\bcomplete (this|the following)\b.{0,40}\b(password|api[ _-]?key|secret|credentials?)\b",
+]
+
+
+def _normalize(text: str) -> str:
+    """NFKC, strip invisible chars, drop diacritics, collapse whitespace."""
+    import unicodedata
+
+    text = unicodedata.normalize("NFKC", text or "")
+    text = _INVISIBLE_RE.sub("", text)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.replace("đ", "d").replace("Đ", "D")
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+MAX_INPUT_CHARS = 2000
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,14 +104,9 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
+    text = _normalize(user_input)
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, text, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +132,19 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    text = _normalize(user_input)
+    if not text:
+        return "BLOCK"
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    for topic in BLOCKED_TOPICS:
+        if re.search(r"\b" + re.escape(topic), text):
+            return "BLOCK"
 
-    pass  # Replace with your implementation
+    extra_allowed = ["bank", "card", "money", "vnd", "rate", "mortgage", "statement"]
+    for topic in list(ALLOWED_TOPICS) + extra_allowed:
+        if re.search(r"\b" + re.escape(topic), text):
+            return "ALLOW"
+    return "BLOCK"
 
 
 # ============================================================
@@ -144,14 +197,27 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # Length guard: oversized input = token-cost / context-stuffing attack
+        if len(text) > MAX_INPUT_CHARS:
+            self.blocked_count += 1
+            return self._block_response(
+                f"Request blocked: message too long ({len(text)} characters, "
+                f"max {MAX_INPUT_CHARS}). Please shorten your question."
+            )
 
-        pass  # Replace with your implementation
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Request blocked: possible prompt injection detected. "
+                "I can only help with VinBank banking questions."
+            )
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Sorry, I can only help with banking topics (accounts, transfers, "
+                "loans, savings, interest rates, credit cards)."
+            )
+        return None
 
 
 # ============================================================
